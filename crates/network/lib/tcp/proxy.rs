@@ -21,8 +21,8 @@ use super::connection::ProxyConnectState;
 use super::connection::ProxyConnectStatus;
 use super::upstream::UpstreamTcpTarget;
 use crate::netstack::shared::SharedState;
-use crate::outbound_proxy::OutboundProxy;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
+use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
     MAX_HTTP_HEADER_BYTES, SecretsHandler, first_line_is_not_http_request,
@@ -138,7 +138,7 @@ pub(crate) struct TcpProxy {
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
-    outbound_proxy: Option<Arc<OutboundProxy>>,
+    outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -288,7 +288,7 @@ impl TcpProxy {
         secrets: Arc<SecretsConfig>,
         tls_state: Option<Arc<TlsState>>,
         proxy_connect: Arc<ProxyConnectState>,
-        outbound_proxy: Option<Arc<OutboundProxy>>,
+        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ) -> Self {
         Self {
             guest_dst,
@@ -794,7 +794,7 @@ pub fn spawn_tcp_proxy(
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
-    outbound_proxy: Option<Arc<OutboundProxy>>,
+    outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
 ) {
     let proxy = TcpProxy::new(
         guest_dst,
@@ -828,7 +828,7 @@ async fn handle_connect_tunnel(
     network_policy: Arc<NetworkPolicy>,
     tls_state: Arc<TlsState>,
     proxy_connect: Arc<ProxyConnectState>,
-    outbound_proxy: Option<Arc<OutboundProxy>>,
+    outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     preconnected_proxy: Option<TcpStream>,
 ) -> io::Result<()> {
     let proxy_dst = proxy_target.primary();
@@ -1579,8 +1579,9 @@ mod tests {
         // contacted directly; the SOCKS5 request below must carry this address.
         let http_proxy_addr: SocketAddr = "93.184.216.34:3128".parse().unwrap();
         let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let outbound_proxy = OutboundProxy::Socks5 {
+        let outbound_proxy = ResolvedOutboundProxy::Socks5 {
             address: socks_listener.local_addr().unwrap(),
+            credentials: None,
         };
         let socks_task = tokio::spawn(async move {
             let (mut client, _) = socks_listener.accept().await.unwrap();
