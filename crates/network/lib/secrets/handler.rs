@@ -750,6 +750,34 @@ impl SecretsHandler {
         self.substitute_ready(data)
     }
 
+    /// Scan an opaque TCP stream for forbidden placeholders without applying
+    /// HTTP framing or substituting real secret values.
+    ///
+    /// Opaque protocols cannot be plain HTTP. Treating their client bytes as
+    /// an incomplete HTTP request can buffer a valid protocol frame forever,
+    /// while substituting into an unrecognized protocol would have no
+    /// trustworthy destination identity or injection scope.
+    pub(crate) fn substitute_opaque<'a>(
+        &mut self,
+        data: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>, ViolationAction> {
+        if self.placeholder_limit_exceeded {
+            tracing::error!(
+                "secret configuration rejected: placeholder exceeds {} bytes",
+                MAX_SECRET_PLACEHOLDER_BYTES
+            );
+            return Err(ViolationAction::Block);
+        }
+
+        self.apply_blocking_action(self.detect_blocking_action(
+            data,
+            "",
+            RequestLocation::Unknown,
+        ))?;
+        self.update_tail(data);
+        Ok(Cow::Borrowed(data))
+    }
+
     fn substitute_http2<'a>(&mut self, data: &[u8]) -> Result<Cow<'a, [u8]>, ViolationAction> {
         let mut state = self.http2_state.take().unwrap_or_default();
         let output = state.process(self, data)?;
@@ -4217,6 +4245,21 @@ mod tests {
         assert_eq!(
             handler.substitute(second).unwrap_err(),
             ViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn opaque_stream_blocks_host_bound_placeholder_split_across_writes() {
+        let mut secret = make_secret("$MSB_KEY", "real-secret", "api.example.com");
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let mut handler = SecretsHandler::new_plain_http_invalid_host(&config);
+
+        let first = b"BINARY3 opaque $MS";
+        assert_eq!(handler.substitute_opaque(first).unwrap(), &first[..]);
+        assert_eq!(
+            handler.substitute_opaque(b"B_KEY request"),
+            Err(ViolationAction::Block)
         );
     }
 

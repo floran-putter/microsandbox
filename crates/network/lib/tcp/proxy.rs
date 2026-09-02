@@ -66,6 +66,24 @@ struct ConnectTarget {
     expected_sni: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirstFlightClass {
+    Tls,
+    Http,
+    Opaque,
+    Unclassified,
+}
+
+impl FirstFlightClass {
+    fn uses_opaque_secret_handling(self) -> bool {
+        matches!(self, Self::Opaque | Self::Unclassified)
+    }
+
+    fn allows_connect(self) -> bool {
+        matches!(self, Self::Http | Self::Unclassified)
+    }
+}
+
 /// Per-connection TCP proxy task and the state it owns.
 pub(crate) struct TcpProxy {
     guest_dst: SocketAddr,
@@ -273,9 +291,9 @@ impl TcpProxy {
         // plain-HTTP candidates, gather a full header block — without blocking the
         // server→guest direction. When domain rules already peeked, `initial_buf`
         // is reused and this is cheap; with no secrets it is skipped entirely
-        // (`is_tls` only matters for deciding whether to build the handler).
+        // (the class only matters for deciding how to handle secrets).
         let want_headers = secrets.has_plain_http_candidates() || secrets.has_host_scoped_secrets();
-        let (initial_buf, is_tls) = if !secrets.secrets.is_empty() {
+        let (initial_buf, first_flight_class) = if !secrets.secrets.is_empty() {
             classify_first_flight(
                 initial_buf,
                 &mut from_smoltcp,
@@ -288,11 +306,11 @@ impl TcpProxy {
             )
             .await?
         } else {
-            (initial_buf, false)
+            (initial_buf, FirstFlightClass::Unclassified)
         };
 
         if let Some(tls_state) = tls_state.clone()
-            && could_be_connect_request(&initial_buf)
+            && should_handle_connect(first_flight_class, &initial_buf)
         {
             // The pre-connect CONNECT peek can miss a client whose first bytes arrive
             // after we dial upstream. Once classify_first_flight has captured that
@@ -317,23 +335,39 @@ impl TcpProxy {
             .await;
         }
 
-        let mut late_connect_state = tls_state;
-        let mut secrets_handler: Option<SecretsHandler> = if !secrets.secrets.is_empty() && !is_tls
-        {
-            Some(match extract_http_host(&initial_buf) {
-                Some(host) => {
-                    SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared)
-                }
-                None => SecretsHandler::new_plain_http_invalid_host(&secrets),
-            })
-        } else {
-            None
-        };
+        let opaque_stream = first_flight_class.uses_opaque_secret_handling();
+        let mut late_connect_state =
+            if first_flight_class == FirstFlightClass::Unclassified && initial_buf.is_empty() {
+                tls_state
+            } else {
+                None
+            };
+        let mut secrets_handler: Option<SecretsHandler> =
+            if !secrets.secrets.is_empty() && first_flight_class != FirstFlightClass::Tls {
+                Some(if opaque_stream {
+                    // Opaque traffic has no verified HTTP Host identity, even
+                    // when its binary framing happens to parse as HTTP.
+                    SecretsHandler::new_plain_http_invalid_host(&secrets)
+                } else {
+                    match extract_http_host(&initial_buf) {
+                        Some(host) => {
+                            SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared)
+                        }
+                        None => SecretsHandler::new_plain_http_invalid_host(&secrets),
+                    }
+                })
+            } else {
+                None
+            };
 
         // Replay the buffered first flight — run through secrets handler first.
         if !initial_buf.is_empty() {
             let out: Cow<[u8]> = match secrets_handler.as_mut() {
-                Some(h) => match h.substitute(&initial_buf) {
+                Some(h) => match if opaque_stream {
+                    h.substitute_opaque(&initial_buf)
+                } else {
+                    h.substitute(&initial_buf)
+                } {
                     // Borrow the input when nothing was substituted; only a chunk
                     // that actually carries a placeholder is reallocated.
                     Ok(cow) => cow,
@@ -400,7 +434,11 @@ impl TcpProxy {
                             // No handler (no secrets / TLS) is the common path: forward
                             // the chunk borrowed, with no per-chunk allocation or copy.
                             let out: Cow<[u8]> = match secrets_handler.as_mut() {
-                                Some(h) => match h.substitute(&bytes) {
+                                Some(h) => match if opaque_stream {
+                                    h.substitute_opaque(&bytes)
+                                } else {
+                                    h.substitute(&bytes)
+                                } {
                                     Ok(cow) => cow,
                                     Err(action) => {
                                         tracing::warn!(dst = %connect_dst, violation = ?action, "secret violation");
@@ -798,6 +836,10 @@ fn could_be_connect_request(buf: &[u8]) -> bool {
     buf[..n].eq_ignore_ascii_case(&PREFIX[..n])
 }
 
+fn should_handle_connect(class: FirstFlightClass, buf: &[u8]) -> bool {
+    class.allows_connect() && could_be_connect_request(buf)
+}
+
 fn parse_connect_request(bytes: Vec<u8>) -> io::Result<ConnectRequest> {
     let header_end = headers_end(&bytes).ok_or_else(|| {
         io::Error::new(
@@ -951,8 +993,9 @@ fn extract_http_host(buf: &[u8]) -> Option<String> {
 }
 
 /// Finish classifying the guest's first flight after the upstream socket is
-/// open, returning the (possibly extended) first-flight buffer and whether it
-/// is a TLS record.
+/// open, returning the (possibly extended) first-flight buffer and its protocol
+/// class. A stream is opaque when the server spoke before buffered guest data
+/// was forwarded or when the guest bytes are conclusively not HTTP or TLS.
 ///
 /// `buf` carries whatever a pre-connect domain-rule peek already captured; when
 /// it is non-empty the TLS/plain decision is already settled and only header
@@ -976,64 +1019,135 @@ async fn classify_first_flight(
     want_headers: bool,
     max: usize,
     budget: Duration,
-) -> io::Result<(Vec<u8>, bool)> {
+) -> io::Result<(Vec<u8>, FirstFlightClass)> {
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
+    let mut server_spoke_first = false;
     let timeout_fut = tokio::time::sleep(budget);
     tokio::pin!(timeout_fut);
 
     loop {
+        // A buffered guest flight can already satisfy the classification rules
+        // before the select below gets another chance to observe the socket.
+        // Probe the upstream first so an already-ready banner remains decisive,
+        // including when `buf` was populated before this function was entered.
+        match server_rx.try_read(&mut server_buf) {
+            Ok(0) => {
+                let class = terminal_first_flight_class(&buf, server_spoke_first);
+                return Ok((buf, class));
+            }
+            Ok(n) => {
+                server_spoke_first = true;
+                let data = Bytes::copy_from_slice(&server_buf[..n]);
+                if to_smoltcp.send(data).await.is_err() {
+                    let class = terminal_first_flight_class(&buf, server_spoke_first);
+                    return Ok((buf, class));
+                }
+                shared.proxy_wake.wake();
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+
+        // Once the server has sent application bytes before any buffered guest
+        // bytes were forwarded upstream, the connection cannot be ordinary
+        // HTTP. Return the guest's first reply immediately and keep the stream
+        // in opaque mode so an HTTP-like binary prefix is not buffered as an
+        // incomplete request.
+        if server_spoke_first && !buf.is_empty() {
+            return Ok((buf, FirstFlightClass::Opaque));
+        }
+
         // Stop as soon as the protocol class is known and — for plain-HTTP
         // candidates — a full header block has arrived. Bail the moment a
         // non-TLS flight stops looking like an HTTP request so non-HTTP
-        // protocols (SSH, Postgres) aren't withheld from upstream for the
-        // whole budget while we wait for a `\r\n\r\n` that never comes.
+        // protocols aren't withheld from upstream for the whole budget while
+        // we wait for a `\r\n\r\n` that never comes.
         if !buf.is_empty() {
             let is_tls = buf.first() == Some(&0x16);
             let not_http = !is_tls
                 && (!looks_like_http_request_prefix(&buf) || first_line_is_not_http_request(&buf));
-            let done = !want_headers
-                || is_tls
-                || not_http
-                || buf.len() >= max
-                || buf.windows(4).any(|w| w == b"\r\n\r\n");
+            let has_headers = buf.windows(4).any(|w| w == b"\r\n\r\n");
+            let done = !want_headers || is_tls || not_http || buf.len() >= max || has_headers;
             if done {
-                return Ok((buf, is_tls));
+                let class = if is_tls {
+                    FirstFlightClass::Tls
+                } else if not_http {
+                    FirstFlightClass::Opaque
+                } else if has_headers {
+                    FirstFlightClass::Http
+                } else if could_be_connect_request(&buf) {
+                    // Preserve CONNECT handling when peeking was optional or
+                    // its request headers reached the first-flight cap.
+                    FirstFlightClass::Unclassified
+                } else {
+                    // An incomplete HTTP-looking prefix is not sufficient
+                    // evidence to inject secrets into the stream.
+                    FirstFlightClass::Opaque
+                };
+                return Ok((buf, class));
             }
         }
 
         tokio::select! {
             biased;
             _ = &mut timeout_fut => {
-                let is_tls = buf.first() == Some(&0x16);
-                return Ok((buf, is_tls));
+                let class = timed_out_first_flight_class(&buf, server_spoke_first);
+                return Ok((buf, class));
             }
-            // Guest → buffer (not forwarded here; the caller replays it once the
-            // handler is built, so substitution applies to the first flight too).
-            guest = from_smoltcp.recv() => match guest {
-                Some(bytes) => buf.extend_from_slice(&bytes),
-                None => {
-                    let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
-                }
-            },
             // Server → guest: relay immediately so a server-first banner is never
-            // held hostage by the peek.
+            // held hostage by the peek. Prefer an already-ready server read over
+            // guest input so immediate guest classification cannot lose this state.
             server = server_rx.read(&mut server_buf) => match server {
                 Ok(0) => {
-                    let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
+                    let class = terminal_first_flight_class(&buf, server_spoke_first);
+                    return Ok((buf, class));
                 }
                 Ok(n) => {
+                    server_spoke_first = true;
                     let data = Bytes::copy_from_slice(&server_buf[..n]);
                     if to_smoltcp.send(data).await.is_err() {
-                        let is_tls = buf.first() == Some(&0x16);
-                        return Ok((buf, is_tls));
+                        let class = terminal_first_flight_class(&buf, server_spoke_first);
+                        return Ok((buf, class));
                     }
                     shared.proxy_wake.wake();
                 }
                 Err(e) => return Err(e),
             },
+            // Guest → buffer (not forwarded here; the caller replays it once the
+            // handler is built, so substitution applies to the first flight too).
+            guest = from_smoltcp.recv() => match guest {
+                Some(bytes) => buf.extend_from_slice(&bytes),
+                None => {
+                    let class = terminal_first_flight_class(&buf, server_spoke_first);
+                    return Ok((buf, class));
+                }
+            },
         }
+    }
+}
+
+fn timed_out_first_flight_class(buf: &[u8], server_spoke_first: bool) -> FirstFlightClass {
+    if server_spoke_first {
+        FirstFlightClass::Opaque
+    } else if buf.first() == Some(&0x16) {
+        FirstFlightClass::Tls
+    } else if buf.is_empty() || could_be_connect_request(buf) {
+        // With no payload, keep the one-shot late CONNECT path available. A
+        // partial CONNECT prefix is handed to the CONNECT request buffer.
+        FirstFlightClass::Unclassified
+    } else {
+        // The inspection budget is terminal for ordinary HTTP detection. Use
+        // scan-only handling so the same bytes cannot be buffered a second time
+        // by the HTTP secret handler while it waits for another terminator.
+        FirstFlightClass::Opaque
+    }
+}
+
+fn terminal_first_flight_class(buf: &[u8], server_spoke_first: bool) -> FirstFlightClass {
+    if !server_spoke_first && buf.first() == Some(&0x16) {
+        FirstFlightClass::Tls
+    } else {
+        FirstFlightClass::Opaque
     }
 }
 
@@ -1264,6 +1378,30 @@ mod tests {
         assert!(could_be_connect_request(b"CONNECT example.com:443"));
         assert!(!could_be_connect_request(b"CLIENT"));
         assert!(!could_be_connect_request(b"GET / HTTP/1.1\r\n"));
+        assert!(should_handle_connect(
+            FirstFlightClass::Http,
+            b"CONNECT example.com:443"
+        ));
+        assert!(should_handle_connect(
+            FirstFlightClass::Unclassified,
+            b"CONNECT example.com:443"
+        ));
+        assert!(!should_handle_connect(
+            FirstFlightClass::Opaque,
+            b"CONNECT example.com:443"
+        ));
+        assert_eq!(
+            timed_out_first_flight_class(b"", false),
+            FirstFlightClass::Unclassified
+        );
+        assert_eq!(
+            timed_out_first_flight_class(b"CON", false),
+            FirstFlightClass::Unclassified
+        );
+        assert_eq!(
+            timed_out_first_flight_class(b"BINARY3 incomplete", false),
+            FirstFlightClass::Opaque
+        );
     }
 
     #[tokio::test]
