@@ -22,7 +22,7 @@ use crate::netstack::shared::SharedState;
 //--------------------------------------------------------------------------------------------------
 
 /// Maximum bytes to buffer while waiting for HTTP request headers.
-const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
 /// Maximum fixed-length HTTP body to buffer for body substitution.
 const MAX_HTTP_BODY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -281,6 +281,7 @@ enum BlockingAction {
 enum RequestProtocol {
     Http1,
     Http2,
+    Opaque,
 }
 
 /// Request location where a placeholder matched.
@@ -429,6 +430,7 @@ impl fmt::Display for RequestProtocol {
         let value = match self {
             Self::Http1 => "http/1.1",
             Self::Http2 => "http/2",
+            Self::Opaque => "opaque",
         };
         f.write_str(value)
     }
@@ -750,6 +752,22 @@ impl SecretsHandler {
         self.substitute_ready(data)
     }
 
+    /// Take raw HTTP bytes retained before this handler produced any output.
+    ///
+    /// The TCP proxy uses this when an upstream banner changes a pending
+    /// first flight from HTTP to opaque. In that state, partial HTTP/2
+    /// prefaces and incomplete fixed-length requests are stored entirely in
+    /// `http_pending`; parser tails in other fields represent bytes that have
+    /// already been returned and must not be replayed.
+    pub(crate) fn take_unwritten_http_bytes(&mut self) -> Vec<u8> {
+        debug_assert!(matches!(
+            self.http_state,
+            HttpState::AwaitingHeaders | HttpState::BufferingBody { .. }
+        ));
+        debug_assert!(self.http2_state.is_none());
+        std::mem::take(&mut self.http_pending)
+    }
+
     /// Scan an opaque TCP stream for forbidden placeholders without applying
     /// HTTP framing or substituting real secret values.
     ///
@@ -769,9 +787,10 @@ impl SecretsHandler {
             return Err(ViolationAction::Block);
         }
 
-        self.apply_blocking_action(self.detect_blocking_action(
+        self.apply_blocking_action(self.detect_blocking_action_for_protocol(
             data,
             "",
+            RequestProtocol::Opaque,
             RequestLocation::Unknown,
         ))?;
         self.update_tail(data);
@@ -1581,12 +1600,27 @@ impl SecretsHandler {
         headers: &str,
         location_hint: RequestLocation,
     ) -> Option<SecretViolationReport> {
+        self.detect_blocking_action_for_protocol(
+            data,
+            headers,
+            RequestProtocol::Http1,
+            location_hint,
+        )
+    }
+
+    fn detect_blocking_action_for_protocol(
+        &self,
+        data: &[u8],
+        headers: &str,
+        protocol: RequestProtocol,
+        location_hint: RequestLocation,
+    ) -> Option<SecretViolationReport> {
         let mut report = detect_blocking_action_with_tail(
             &self.ineligible_for_substitution,
             &self.prev_tail,
             data,
             headers,
-            RequestProtocol::Http1,
+            protocol,
             location_hint,
             None,
         );
@@ -2180,6 +2214,7 @@ fn request_summary(headers: &str, protocol: RequestProtocol) -> RequestSummary {
     match protocol {
         RequestProtocol::Http1 => http1_request_summary(headers),
         RequestProtocol::Http2 => http2_request_summary(headers),
+        RequestProtocol::Opaque => RequestSummary::default(),
     }
 }
 
@@ -4261,6 +4296,28 @@ mod tests {
             handler.substitute_opaque(b"B_KEY request"),
             Err(ViolationAction::Block)
         );
+    }
+
+    #[test]
+    fn opaque_stream_violations_report_the_opaque_protocol() {
+        let mut secret = make_secret("$MSB_KEY", "real-secret", "api.example.com");
+        secret.require_tls_identity = false;
+        let config = make_config(vec![secret]);
+        let handler = SecretsHandler::new_plain_http_invalid_host(&config);
+
+        let report = handler
+            .detect_blocking_action_for_protocol(
+                b"BINARY3 $MSB_KEY",
+                "",
+                RequestProtocol::Opaque,
+                RequestLocation::Unknown,
+            )
+            .expect("opaque placeholder must be reported");
+
+        assert_eq!(report.protocol.to_string(), "opaque");
+        assert!(report.method.is_none());
+        assert!(report.path.is_none());
+        assert!(report.host.is_none());
     }
 
     #[test]
