@@ -1842,6 +1842,75 @@ mod tests {
         handle.await.unwrap()
     }
 
+    async fn assert_server_first_banner_is_immediate(
+        policy: NetworkPolicy,
+        tls_state: Option<Arc<TlsState>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"READY\n").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+        });
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(policy),
+            Arc::new(SecretsConfig::default()),
+            tls_state,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+
+        let banner = tokio::time::timeout(Duration::from_secs(1), to_rx.recv())
+            .await
+            .expect("server-first banner was delayed by a pre-connect peek")
+            .expect("proxy closed before relaying the server-first banner");
+        assert_eq!(banner, b"READY\n"[..]);
+
+        drop(from_tx);
+        tokio::time::timeout(Duration::from_secs(7), server)
+            .await
+            .expect("proxy did not close the upstream connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_first_connection_skips_unrelated_domain_policy_peek() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![allow_https("unused.example")],
+        };
+
+        assert_server_first_banner_is_immediate(policy, None).await;
+    }
+
+    #[tokio::test]
+    async fn server_first_connection_skips_eager_connect_peek() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tls_state = Arc::new(
+            TlsState::new(
+                microsandbox_types::TlsConfig::default(),
+                crate::secrets::handle::SecretsHandle::new(SecretsConfig::default()),
+            )
+            .unwrap(),
+        );
+
+        assert_server_first_banner_is_immediate(NetworkPolicy::default(), Some(tls_state)).await;
+    }
+
     #[tokio::test]
     async fn plain_http_substitutes_placeholder_when_host_arrives_in_second_segment() {
         // Host header split across TCP segments — classify_first_flight must keep
