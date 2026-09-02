@@ -1843,6 +1843,343 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_first_http_like_binary_first_flight_is_forwarded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"binary server-first greeting")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        let secrets = Arc::new(make_plain_http_secret(
+            "$MSB_UNUSED",
+            "unused-secret-value",
+            false,
+        ));
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::default()),
+            secrets,
+            None,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+
+        let greeting = to_rx.recv().await.unwrap();
+        assert_eq!(greeting, b"binary server-first greeting"[..]);
+
+        // `BINARY3` is deliberately a valid HTTP token followed by a space,
+        // but this invented binary frame has no HTTP request line or headers.
+        // The configured secret is unrelated and only enables HTTP inspection.
+        let first_flight = Bytes::from_static(b"BINARY3 v1\x00\x01opaque request");
+        from_tx.send(first_flight.clone()).await.unwrap();
+        drop(from_tx);
+
+        let wire = tokio::time::timeout(Duration::from_secs(7), server)
+            .await
+            .expect("proxy did not finish forwarding the client first flight")
+            .unwrap();
+        assert_eq!(wire, first_flight);
+    }
+
+    #[tokio::test]
+    async fn server_first_http_shaped_payload_cannot_claim_host_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"binary server-first greeting")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let shared = Arc::new(SharedState::new(4));
+        shared.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [addr.ip()],
+            StdDuration::from_secs(60),
+        );
+        let mut secrets = make_host_bound_secret("$MSB_KEY", "real-secret-value", "example.com");
+        secrets.secrets[0].require_tls_identity = false;
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            shared,
+            Arc::new(NetworkPolicy::default()),
+            Arc::new(secrets),
+            None,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+
+        let greeting = to_rx.recv().await.unwrap();
+        assert_eq!(greeting, b"binary server-first greeting"[..]);
+
+        // Even a byte-for-byte valid HTTP shape cannot establish a trusted
+        // Host identity after the server has proven the stream is server-first.
+        from_tx
+            .send(Bytes::from_static(
+                b"BINARY3 /opaque HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer $MSB_KEY\r\n\r\n",
+            ))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        let wire = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("proxy did not close after the forbidden placeholder")
+            .unwrap();
+        assert!(wire.is_empty(), "opaque placeholder reached upstream");
+    }
+
+    #[tokio::test]
+    async fn server_first_http_like_payload_is_forwarded_after_guest_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream
+                .write_all(b"binary server-first greeting")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        let first_flight = Bytes::from_static(b"BINARY3 v1\x00\x01eof opaque request");
+        from_tx.send(first_flight.clone()).await.unwrap();
+        drop(from_tx);
+
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::default()),
+            Arc::new(make_plain_http_secret(
+                "$MSB_UNUSED",
+                "unused-secret-value",
+                false,
+            )),
+            None,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+
+        let greeting = tokio::time::timeout(Duration::from_secs(2), to_rx.recv())
+            .await
+            .expect("proxy did not relay the delayed server-first greeting")
+            .unwrap();
+        assert_eq!(greeting, b"binary server-first greeting"[..]);
+
+        let wire = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("proxy did not finish after guest EOF")
+            .unwrap();
+        assert_eq!(wire, first_flight);
+    }
+
+    #[tokio::test]
+    async fn server_first_http_like_payload_is_forwarded_after_classification_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(PEEK_BUDGET + Duration::from_millis(100)).await;
+            stream
+                .write_all(b"binary server-first greeting")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
+        let first_flight = Bytes::from_static(b"BINARY3 v1\x00\x01timeout opaque request");
+        from_tx.send(first_flight.clone()).await.unwrap();
+
+        spawn_tcp_proxy(
+            &tokio::runtime::Handle::current(),
+            addr,
+            addr,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::default()),
+            Arc::new(make_plain_http_secret(
+                "$MSB_UNUSED",
+                "unused-secret-value",
+                false,
+            )),
+            None,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+
+        let greeting = tokio::time::timeout(PEEK_BUDGET + Duration::from_secs(2), to_rx.recv())
+            .await
+            .expect("proxy did not relay the delayed server-first greeting")
+            .unwrap();
+        assert_eq!(greeting, b"binary server-first greeting"[..]);
+        drop(from_tx);
+
+        let wire = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("proxy did not finish after the classification timeout")
+            .unwrap();
+        assert_eq!(wire, first_flight);
+    }
+
+    #[tokio::test]
+    async fn server_first_state_wins_when_banner_and_opaque_payload_are_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let (client, accepted) = tokio::join!(connect, listener.accept());
+        let client = client.unwrap();
+        let (mut server, _) = accepted.unwrap();
+
+        server
+            .write_all(b"binary server-first greeting")
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+        client.readable().await.unwrap();
+
+        let (mut server_rx, _server_tx) = client.into_split();
+        let (from_tx, mut from_rx) = mpsc::channel::<Bytes>(1);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(1);
+        let first_flight =
+            Bytes::from_static(b"BINARY3 /opaque HTTP/1.1\r\nX-Binary: \x00\x01\r\n\r\n");
+        from_tx.send(first_flight.clone()).await.unwrap();
+
+        let (buffered, _class) = tokio::time::timeout(
+            Duration::from_millis(500),
+            classify_first_flight(
+                Vec::new(),
+                &mut from_rx,
+                &mut server_rx,
+                &to_tx,
+                &SharedState::new(4),
+                true,
+                PEEK_BUF_SIZE,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("ready server-first data did not finish classification")
+        .unwrap();
+
+        assert_eq!(buffered, first_flight);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), to_rx.recv())
+                .await
+                .expect("ready server-first greeting was not relayed")
+                .unwrap(),
+            b"binary server-first greeting"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn server_first_state_survives_buffered_guest_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let (client, accepted) = tokio::join!(connect, listener.accept());
+        let client = client.unwrap();
+        let (mut server, _) = accepted.unwrap();
+
+        server
+            .write_all(b"binary server-first greeting")
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+        client.readable().await.unwrap();
+
+        let (mut server_rx, _server_tx) = client.into_split();
+        let (_from_tx, mut from_rx) = mpsc::channel::<Bytes>(1);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(1);
+        let first_flight = b"BINARY3 /opaque HTTP/1.1\r\nX-Binary: \x00\x01\r\n\r\n".to_vec();
+
+        let (buffered, _class) = tokio::time::timeout(
+            Duration::from_millis(500),
+            classify_first_flight(
+                first_flight.clone(),
+                &mut from_rx,
+                &mut server_rx,
+                &to_tx,
+                &SharedState::new(4),
+                true,
+                PEEK_BUF_SIZE,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("server-first state was lost for buffered guest data")
+        .unwrap();
+
+        assert_eq!(buffered, first_flight);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), to_rx.recv())
+                .await
+                .expect("ready server-first greeting was not relayed")
+                .unwrap(),
+            b"binary server-first greeting"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_http_first_flight_is_forwarded_without_secret_substitution() {
+        let (addr, sink) = spawn_sink().await;
+        let secrets = make_plain_http_secret("$MSB_KEY", "real-secret-value", false);
+        let first_flight = b"\x01opaque\r\nAuthorization: Bearer $MSB_KEY\r\n\r\n".to_vec();
+
+        let wire = relay_through_proxy(first_flight.clone(), secrets, sink, addr).await;
+
+        assert_eq!(wire, first_flight);
+    }
+
+    #[tokio::test]
     async fn plain_http_substitutes_placeholder_when_host_arrives_in_second_segment() {
         // Host header split across TCP segments — classify_first_flight must keep
         // reading until \r\n\r\n before extract_http_host is called.
