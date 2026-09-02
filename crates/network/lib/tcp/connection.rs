@@ -89,6 +89,8 @@ struct Connection {
     src: SocketAddr,
     /// Original destination (from the guest's SYN).
     dst: SocketAddr,
+    /// Whether egress policy deferred this flow until an SNI hostname is available.
+    hostname_policy_deferred: bool,
     /// Sends data from smoltcp socket to proxy task (guest → server).
     ///
     /// Set to `None` once the guest half-closes (FIN) and all its data has
@@ -130,6 +132,8 @@ struct ProxyChannels {
 pub struct NewConnection {
     /// Original destination the guest was connecting to.
     pub dst: SocketAddr,
+    /// Whether egress policy must inspect the first client flight before dialing upstream.
+    pub hostname_policy_deferred: bool,
     /// Receive data from smoltcp socket (guest → proxy task).
     pub from_smoltcp: mpsc::Receiver<Bytes>,
     /// Send data to smoltcp socket (proxy task → guest).
@@ -225,6 +229,7 @@ impl ConnectionTracker {
         &mut self,
         src: SocketAddr,
         dst: SocketAddr,
+        hostname_policy_deferred: bool,
         sockets: &mut SocketSet<'_>,
     ) -> bool {
         if self.connections.len() >= self.max_connections {
@@ -262,6 +267,7 @@ impl ConnectionTracker {
             Connection {
                 src,
                 dst,
+                hostname_policy_deferred,
                 to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
                 proxy_channels: Some(ProxyChannels {
@@ -405,6 +411,7 @@ impl ConnectionTracker {
                 if let Some(channels) = conn.proxy_channels.take() {
                     new.push(NewConnection {
                         dst: conn.dst,
+                        hostname_policy_deferred: conn.hostname_policy_deferred,
                         from_smoltcp: channels.from_smoltcp,
                         to_smoltcp: channels.to_smoltcp,
                         proxy_connect: conn.proxy_connect.clone(),

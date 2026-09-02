@@ -356,11 +356,12 @@ pub fn smoltcp_poll_loop(
 
             match classify_frame(frame) {
                 FrameAction::TcpSyn { src, dst } => {
-                    let allow = match DnsPortType::from_tcp(dst.port()) {
+                    let (allow, hostname_policy_deferred) = match DnsPortType::from_tcp(dst.port())
+                    {
                         // Plain DNS: the interceptor enforces policy at
                         // the application layer (block list + rebind
                         // protection); bypass the network egress check.
-                        DnsPortType::Dns => true,
+                        DnsPortType::Dns => (true, false),
                         // DoT: intercept only when TLS MITM is
                         // configured. Without it, the block list can't
                         // apply (traffic is encrypted end-to-end), so
@@ -371,10 +372,10 @@ pub fn smoltcp_poll_loop(
                         // per query by the forwarder.
                         DnsPortType::EncryptedDns => {
                             if tls_state.is_some() {
-                                true
+                                (true, false)
                             } else {
                                 tracing::debug!(%dst, "DoT port refused (TLS interception not configured); stub should fall back to TCP/53");
-                                false
+                                (false, false)
                             }
                         }
                         // Alternative DNS protocol we can't proxy:
@@ -384,7 +385,7 @@ pub fn smoltcp_poll_loop(
                         // plain TCP/53.
                         DnsPortType::AlternativeDns => {
                             tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
-                            false
+                            (false, false)
                         }
                         // Other: regular outbound — defer Domain rules to first-flight;
                         // accept unless an IP-layer rule denies.
@@ -394,20 +395,30 @@ pub fn smoltcp_poll_loop(
                                     .evaluate_egress(dst, Protocol::Tcp, &shared)
                                     .is_allow()
                             });
-                            platform_allows
-                                && matches!(
-                                    network_policy.evaluate_egress_with_source(
-                                        dst,
-                                        Protocol::Tcp,
-                                        &shared,
-                                        HostnameSource::Deferred,
+                            let egress = network_policy.evaluate_egress_with_source(
+                                dst,
+                                Protocol::Tcp,
+                                &shared,
+                                HostnameSource::Deferred,
+                            );
+                            (
+                                platform_allows
+                                    && matches!(
+                                        egress,
+                                        EgressEvaluation::Allow
+                                            | EgressEvaluation::DeferUntilHostname
                                     ),
-                                    EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname
-                                )
+                                matches!(egress, EgressEvaluation::DeferUntilHostname),
+                            )
                         }
                     };
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
-                        conn_tracker.create_tcp_socket(src, dst, &mut sockets);
+                        conn_tracker.create_tcp_socket(
+                            src,
+                            dst,
+                            hostname_policy_deferred,
+                            &mut sockets,
+                        );
                     }
                     // Let smoltcp process — matching socket completes
                     // handshake, no socket means auto-RST.
@@ -602,6 +613,7 @@ pub fn smoltcp_poll_loop(
                 conn.to_smoltcp,
                 shared.clone(),
                 network_policy.clone(),
+                conn.hostname_policy_deferred,
                 // Load the current snapshot per connection so live secret
                 // updates apply to traffic the guest starts afterwards.
                 secrets.load(),
@@ -1961,7 +1973,7 @@ mod tests {
         // 1) Guest SYN — tracker creates the listening socket first (as the
         //    real poll loop does), then smoltcp completes the handshake.
         assert!(
-            tracker.create_tcp_socket(src, dst, sockets),
+            tracker.create_tcp_socket(src, dst, false, sockets),
             "socket creation should succeed under the limit"
         );
         ingress(
@@ -2296,7 +2308,7 @@ mod tests {
         for port in 40000u16..40004 {
             let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), port);
             assert!(
-                tracker.create_tcp_socket(src, dst, &mut sockets),
+                tracker.create_tcp_socket(src, dst, false, &mut sockets),
                 "creation under the limit must succeed",
             );
         }
@@ -2305,7 +2317,7 @@ mod tests {
         // sees egress as unreachable.
         let src = SocketAddr::new(Ipv4Addr::from(GUEST_IP).into(), 40004);
         assert!(
-            !tracker.create_tcp_socket(src, dst, &mut sockets),
+            !tracker.create_tcp_socket(src, dst, false, &mut sockets),
             "creation at the limit must be refused",
         );
     }

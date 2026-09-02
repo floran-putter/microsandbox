@@ -74,6 +74,7 @@ pub(crate) struct TcpProxy {
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
+    hostname_policy_deferred: bool,
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
@@ -139,6 +140,7 @@ impl TcpProxy {
         to_smoltcp: mpsc::Sender<Bytes>,
         shared: Arc<SharedState>,
         network_policy: Arc<NetworkPolicy>,
+        hostname_policy_deferred: bool,
         secrets: Arc<SecretsConfig>,
         tls_state: Option<Arc<TlsState>>,
         proxy_connect: Arc<ProxyConnectState>,
@@ -151,6 +153,7 @@ impl TcpProxy {
             to_smoltcp,
             shared,
             network_policy,
+            hostname_policy_deferred,
             secrets,
             tls_state,
             proxy_connect,
@@ -182,18 +185,17 @@ impl TcpProxy {
             to_smoltcp,
             shared,
             network_policy,
+            hostname_policy_deferred,
             secrets,
             tls_state,
             proxy_connect,
             outbound_proxy,
         } = self;
 
-        // Pre-connect peek is only for domain policy: the hostname has to be known
-        // before we dial upstream so a Deny never opens a connection. Secrets do
-        // *not* gate the connect, so they no longer force a peek here — that work is
-        // deferred to `classify_first_flight` after the socket is open, where it can
-        // run without stalling server-first protocols (see below).
-        let (mut initial_buf, sni) = if network_policy.has_domain_rules() {
+        // The SYN handler already established whether this particular flow needs an
+        // SNI hostname for policy evaluation. Do not stall a server-first protocol
+        // merely because an unrelated Domain rule exists elsewhere in the policy.
+        let (initial_buf, sni) = if hostname_policy_deferred {
             peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await
         } else {
             (Vec::new(), None)
@@ -204,7 +206,7 @@ impl TcpProxy {
         // refines over-allow when the cache matched a shared CDN IP;
         // CacheOnly is the non-TLS fallback path so Domain rules still
         // gate plain HTTP / SSH / etc.
-        if network_policy.has_domain_rules() {
+        if hostname_policy_deferred {
             let source = match sni.as_deref() {
                 Some(name) => HostnameSource::Sni(name),
                 None => HostnameSource::CacheOnly,
@@ -235,28 +237,27 @@ impl TcpProxy {
             }
         }
 
-        // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
-        if let Some(tls_state) = tls_state.clone() {
-            if initial_buf.is_empty() {
-                let (peeked, _) = peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await;
-                initial_buf = peeked;
-            }
-            if could_be_connect_request(&initial_buf) {
-                return handle_connect_tunnel(
-                    guest_dst,
-                    connect_target,
-                    initial_buf,
-                    from_smoltcp,
-                    to_smoltcp,
-                    shared,
-                    network_policy,
-                    tls_state,
-                    proxy_connect,
-                    outbound_proxy,
-                    None,
-                )
-                .await;
-            }
+        // A domain-policy peek may already have captured a CONNECT request. Otherwise
+        // defer CONNECT classification until after the upstream socket is open, so a
+        // server-first protocol never waits for client bytes just because TLS is enabled.
+        if let Some(tls_state) = tls_state.clone()
+            && !initial_buf.is_empty()
+            && could_be_connect_request(&initial_buf)
+        {
+            return handle_connect_tunnel(
+                guest_dst,
+                connect_target,
+                initial_buf,
+                from_smoltcp,
+                to_smoltcp,
+                shared,
+                network_policy,
+                tls_state,
+                proxy_connect,
+                outbound_proxy,
+                None,
+            )
+            .await;
         }
 
         // Connect upstream *before* finishing the secrets-side classification. A
@@ -492,6 +493,15 @@ pub fn spawn_tcp_proxy(
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<OutboundProxy>>,
 ) {
+    let hostname_policy_deferred = matches!(
+        network_policy.evaluate_egress_with_source(
+            guest_dst,
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        ),
+        EgressEvaluation::DeferUntilHostname
+    );
     let proxy = TcpProxy::new(
         guest_dst,
         UpstreamTcpTarget::direct(connect_dst),
@@ -499,6 +509,7 @@ pub fn spawn_tcp_proxy(
         to_smoltcp,
         shared,
         network_policy,
+        hostname_policy_deferred,
         secrets,
         tls_state,
         proxy_connect,
@@ -1830,6 +1841,7 @@ mod tests {
             to_tx,
             Arc::new(shared),
             policy,
+            false,
             secrets,
             None,
             proxy_connect,
@@ -1941,6 +1953,7 @@ mod tests {
             to_tx,
             Arc::new(SharedState::new(4)),
             Arc::new(NetworkPolicy::default()),
+            false,
             Arc::new(secrets),
             None,
             proxy_connect,
@@ -2013,6 +2026,7 @@ mod tests {
             to_tx,
             Arc::new(shared),
             Arc::new(NetworkPolicy::default()),
+            false,
             Arc::new(secrets),
             None,
             proxy_connect,
@@ -2115,6 +2129,7 @@ mod tests {
             to_tx,
             Arc::new(SharedState::new(4)),
             Arc::new(NetworkPolicy::default()),
+            false,
             Arc::new(secrets),
             None,
             proxy_connect,
